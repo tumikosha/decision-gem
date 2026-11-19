@@ -5,7 +5,7 @@ Gemma (MLX). It answers three kinds of questions about a text (the "state"): yes
 on a scale. No text is generated: the answer is read from the probabilities of the options' letters. Runs offline.
 The same model also answers ordinary prompts by generating (`generate`, see "Prompts").
 
-Russian version: [README.md](README.md).
+Russian version: [README.md](https://github.com/tumikosha/decision-gem/blob/main/README.md).
 
 ## What it does
 
