@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 — 2026-11-19
+
+### Added
+- `orders="single"` (`--orders single`): one pass per question, about 2.5x faster than `reverse`; nothing is
+  cancelled and `orders_agree` is `null`.
+
+### Changed
+- README.md is the English README, README.ru.md the Russian one.
+
 ## 0.1.0 — 2026-11-19
 
 First release.

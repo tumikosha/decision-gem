@@ -18,6 +18,7 @@ at the first answer position are read. Every question is read in several option 
 of each option are averaged, so a preference for a letter or a position cancels out. orders="reverse" (default): twice,
 in order and reversed — 2 passes, but with 3+ options the middle stays in the middle, so a pull to or from the middle
 letters is not cancelled. orders="cyclic": every rotation, each option once under every letter — n passes.
+orders="single": in order only — 1 pass, the fastest, nothing cancelled, and orders_agree is None.
 confidence is the probability of the answer. Calibration (Platt scaling on hand-labelled calls) per question id:
 noul p = sigmoid(a * logit + b) from [a, b]; choice / score probabilities = softmax(logprob / T) from T.
 
@@ -39,7 +40,7 @@ _QUESTION = "\x00question\x00"   # where the question goes in the rendered promp
 STATE_INTRO = "Read the state below, then answer the question after it.\n\n<state>\n"
 STATE_CLOSE = "\n</state>\n\n"   # what follows the state text; an open state leaves it out of the cache
 KINDS = ("noul", "choice", "score")
-ORDERS = ("reverse", "cyclic")
+ORDERS = ("reverse", "cyclic", "single")
 
 
 def options_of(question):
@@ -81,6 +82,8 @@ def orders_of(n, how="reverse"):
         return [list(range(n)), list(range(n))[::-1]]
     if how == "cyclic":
         return [[(s + i) % n for i in range(n)] for s in range(n)]
+    if how == "single":
+        return [list(range(n))]
     raise ValueError(f"orders must be one of {', '.join(ORDERS)}, got {how!r}")
 
 
@@ -250,7 +253,7 @@ def fit_calibration(answers, labels):
 class DecisionGem:
     def __init__(self, repo=MODEL, calibration=None, offline=True, cache_limit=0, orders="reverse", float32=True):
         """repo: a Hugging Face repo id or a local model folder. offline: load only what is in the local HF cache.
-        orders: the option orders every question is read in, "reverse" or "cyclic" (see the module doc).
+        orders: the option orders every question is read in, "reverse", "cyclic" or "single" (see the module doc).
         cache_limit: bytes of freed buffers MLX may keep for reuse (mx.set_cache_limit), None to leave MLX's own.
         MLX's limit is the process's: unload() puts back the one there was.
         float32: compute in float32 (the bf16 norms and quantization scales cast up; +1.5 GiB, KV cache 2x, reads
@@ -422,7 +425,8 @@ class DecisionGem:
                 for pos, i in enumerate(order):
                     logprobs[i] += (z[pos] - lse) / len(read)
                 picks.append(order[max(range(n), key=lambda pos: z[pos])])
-            answers[qid] = answer(question, items, logprobs, len(set(picks)) == 1, self.calibration.get(qid), raw)
+            answers[qid] = answer(question, items, logprobs, len(set(picks)) == 1 if len(read) > 1 else None,
+                                   self.calibration.get(qid), raw)
         return {"model": f"decision-gem/{self.repo.rstrip('/').split('/')[-1]}", "answers": answers,
                 "usage": {"input_tokens": used, "output_tokens": 0}}
 

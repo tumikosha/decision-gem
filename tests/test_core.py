@@ -381,3 +381,13 @@ def test_fit_needs_raw_answers_and_both_classes():
         fit_calibration(one_class, [{"q": True}, {"q": True}])
     with pytest.raises(ValueError, match="same length"):
         fit_calibration(one_class, [{"q": True}])
+
+
+def test_single_reads_once_and_has_no_agreement():
+    assert orders_of(3, "single") == [[0, 1, 2]]
+    qs = {"q": {"type": "choice", "criteria": ["good", "mid", "bad"]}}
+    one = _biased_gem().decide("state", qs, orders="single")["answers"]["q"]
+    assert one["choice"] == "mid"                                   # one pass: the pull to B is not cancelled
+    assert one["orders_agree"] is None                              # one order: nothing to agree with
+    noul = _biased_gem("single").decide("state", {"n": {"type": "noul"}})["answers"]["n"]
+    assert noul["orders_agree"] is None

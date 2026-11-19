@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "decision-gem"
-version = "0.1.0"
+version = "0.2.0"
 description = "Jev-style decision model (noul / choice / score) on a local Gemma, MLX; prompts too"
-readme = "README.en.md"
+readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "tumi" }]

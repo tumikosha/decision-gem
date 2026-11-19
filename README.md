@@ -1,250 +1,253 @@
 # decision-gem
 
-Модель решений в стиле [TypeSafe Jev](https://developers.cloudflare.com/ai/models/typesafe/jev/) на локальной Gemma
-(MLX). Отвечает на вопросы трёх типов о тексте («состоянии»): да / нет, выбор из вариантов, оценка по шкале.
-Текст не генерируется: ответ читается из вероятностей букв вариантов. Работает без сети. Та же модель отвечает и на
-обычные промпты генерацией (`generate`, см. «Промпты»).
+A decision model in the style of [TypeSafe Jev](https://developers.cloudflare.com/ai/models/typesafe/jev/) on a local
+Gemma (MLX). It answers three kinds of questions about a text (the "state"): yes / no, a choice among options, a score
+on a scale. No text is generated: the answer is read from the probabilities of the options' letters. Runs offline.
+The same model also answers ordinary prompts by generating (`generate`, see "Prompts").
 
-English version: [README.en.md](README.en.md).
+Russian version: [README.ru.md](https://github.com/tumikosha/decision-gem/blob/main/README.ru.md).
 
-## Что умеет
+## What it does
 
-Запрос: `{"state": текст или JSON-объект, "questions": {id: вопрос}}`.
+Request: `{"state": text or JSON object, "questions": {id: question}}`.
 
-| Тип | Вопрос | Ответ |
+| Type | Question | Answer |
 |---|---|---|
-| `noul` | `instructions`, `criteria` `{"true": …, "false": …}` (необязательно) | `noul` = P(true) |
-| `choice` | `instructions`, `criteria` `{вариант: описание}` или `[вариант, …]`, 2..26 | `choice`, `confidence`, `probabilities` |
-| `score` | `instructions`, `criteria` `{значение: описание}` или `[описание, …]` (уровни 1..N), 2..10 | `score` = Σ p·значение, `confidence`, `legend`, `probabilities` |
+| `noul` | `instructions`, `criteria` `{"true": …, "false": …}` (optional) | `noul` = P(true) |
+| `choice` | `instructions`, `criteria` `{option: description}` or `[option, …]`, 2..26 | `choice`, `confidence`, `probabilities` |
+| `score` | `instructions`, `criteria` `{value: description}` or `[description, …]` (levels 1..N), 2..10 | `score` = Σ p·value, `confidence`, `legend`, `probabilities` |
 
-В каждом ответе сверх Jev есть `orders_agree`: совпал ли выбор во всех порядках вариантов (см. ниже). `false`
-означает неуверенный ответ, такой стоит проверить. Ответ целиком: `{"model", "answers": {id: ответ},
+Beyond Jev, every answer has `orders_agree`: whether the choice is the same in every option order (below).
+`false` means an unsure answer, worth checking. The whole response: `{"model", "answers": {id: answer},
 "usage": {"input_tokens", "output_tokens": 0}}`.
 
-Как работает:
-1. Состояние один раз читается в KV-кэш.
-2. Каждый вопрос дописывается к копии кэша, варианты под буквами A, B, C …
-3. Берутся логиты букв на первой позиции ответа.
-4. Вопрос читается в нескольких порядках вариантов. Лог-вероятности каждого варианта усредняются, так что
-   предпочтение буквы или позиции гасится.
+How it works:
+1. The state is read once into a KV cache.
+2. Each question is appended to a copy of the cache, its options under the letters A, B, C …
+3. The logits of those letters at the first answer position are read.
+4. Each question is read in several option orders. Each option's log-probabilities are averaged, so a
+   preference for a letter or a position cancels out.
 
-### Порядки вариантов
+### Option orders
 
-`DecisionGem(orders=...)`, на один запрос `decide(..., orders=...)`, в CLI `--orders`:
+`DecisionGem(orders=...)`, per request `decide(..., orders=...)`, on the CLI `--orders`:
 
-| `orders` | Проходов на вопрос | Что гасит |
+| `orders` | Passes per question | What cancels |
 |---|---|---|
-| `"reverse"` (по умолчанию) | 2: прямой и обратный | при 2 вариантах — всё; при 3+ середина остаётся серединой (у 3 вариантов B — B в обоих), тяга к средним буквам или от них не гасится |
-| `"cyclic"` | n: все сдвиги по циклу | каждый вариант по разу под каждой буквой — позиция гасится полностью |
+| `"reverse"` (default) | 2: in order and reversed | with 2 options, everything; with 3+ the middle stays in the middle (of 3 options, B is B both times), so a pull to or from the middle letters stays |
+| `"cyclic"` | n: every rotation | each option once under every letter: position cancels fully |
+| `"single"` | 1: in order only | nothing; the fastest, `orders_agree` is `null` |
 
-Для noul (2 варианта) оба режима — одни и те же два прохода.
+For noul (2 options) `reverse` and `cyclic` are the same two passes.
 
-`orders_agree` в `cyclic` — согласие всех n проходов, это строже двух; доля `false` между режимами не сравнима.
-Калибровка `T` подобрана на `reverse`; для `cyclic` её надо подбирать заново.
+Under `cyclic`, `orders_agree` means all n passes agree, stricter than two; its `false` rate is not comparable
+across modes. Calibration `T` was fitted on `reverse`; fit it again for `cyclic` and `single`.
 
-### Калибровка
+`single` is for speed, where position bias does not matter or a calibration takes it out. Gemma 26B, a 1300-token
+thread, 2026-11-19, M4 Max: 112 ms per question vs 277 ms under `reverse`; the answers to 6 questions matched.
 
-Сырые вероятности LLM слишком уверенные: `noul` 1.0 не значит «да» в 100 % случаев. Калибровка пересчитывает их так,
-чтобы 0.8 значило «да» примерно в 80 % таких ответов. У каждого вопроса своя ошибка, поэтому коэффициенты хранятся
-по id вопроса: `[a, b]` для noul (`p = sigmoid(a·logit + b)`, `logit` — разность лог-вероятностей true и false),
-`T` для choice / score (`softmax(logprob / T)`, `T > 1` смягчает).
+### Calibration
+
+Raw LLM probabilities are overconfident: `noul` 1.0 does not mean "yes" 100% of the time. Calibration remaps them so
+that 0.8 means "yes" in about 80% of such answers. Each question has its own bias, so the coefficients are kept per
+question id: `[a, b]` for noul (`p = sigmoid(a·logit + b)`, `logit` being the log-probability of true minus that of
+false), `T` for choice / score (`softmax(logprob / T)`, `T > 1` softens).
 
 ```json
 {"spam": [0.35, -0.8], "kind": 2.1}
 ```
 
-Файл передаётся в `DecisionGem(calibration=...)` или `--calibration cal.json`. Как подобрать:
+Pass it as `DecisionGem(calibration=...)` or `--calibration cal.json`. To fit it:
 
-1. Разметить вручную 100–300 своих текстов: ответ на каждый вопрос.
-2. Получить ответы с сырыми лог-вероятностями: `decide(..., raw=True)`, `{"raw": true}` в запросе или `--raw` в CLI.
-   Каждый ответ получает `logprobs` {вариант: лог-вероятность до калибровки}.
-3. `fit_calibration(answers, labels)` возвращает готовую калибровку.
+1. Label 100–300 of your own texts by hand: the answer to every question.
+2. Get answers with the raw log-probabilities: `decide(..., raw=True)`, `{"raw": true}` in a request or `--raw` in the
+   CLI. Every answer gets `logprobs` {option: log-probability before calibration}.
+3. `fit_calibration(answers, labels)` returns the calibration.
 
 ```python
 from decision_gem import DecisionGem, fit_calibration
 
 with DecisionGem() as gem:
     answers = [gem.decide(text, qs, raw=True)["answers"] for text in texts]
-cal = fit_calibration(answers, labels)   # labels: [{"spam": True, "kind": "phishing"}, ...] в том же порядке
+cal = fit_calibration(answers, labels)   # labels: [{"spam": True, "kind": "phishing"}, ...] in the same order
 ```
 
-Метка — `True` / `False` для noul, вариант для choice, уровень для score; вопрос без метки в тексте пропускается.
-noul подбирается методом Platt (логистическая регрессия на `logit`), `T` — минимумом log-loss. Нужны обе метки noul
-и ошибки модели в разметке: на наборе, где модель права всегда, `T` уходит к 0.01, а `a` растёт.
+A label is `True` / `False` for noul, the option for choice, the level for score; a question with no label in a text is
+skipped. noul is fitted by Platt scaling (logistic regression on `logit`), `T` by the least log-loss. Both noul labels
+and some model mistakes must be in the set: where the model is always right, `T` goes to 0.01 and `a` grows.
 
 
-## Отличия от Jev
+## Differences from Jev
 
-Запрос и ответ — как у Jev (noul / choice / score). Отличается всё под контрактом. Данные о Jev — из документации
-Cloudflare и TypeSafe (`docs.typesafe.ai/models.md`), ноябрь 2026; устройство Jev там не раскрыто.
+The request and the response are Jev's (noul / choice / score). Everything under the contract differs. Facts about Jev
+come from the Cloudflare and TypeSafe docs (`docs.typesafe.ai/models.md`), November 2026; they do not disclose how Jev
+works inside.
 
 | | Jev (TypeSafe) | decision-gem |
 |---|---|---|
-| Где работает | облачный API (Cloudflare Workers AI, TypeSafe `POST /v1/systemone`), $0.042 за 1M входных токенов | локально на Apple silicon (MLX), без сети, данные не уходят |
-| Модель | своя, обучена давать калиброванные решения (RLCD), архитектура не раскрыта | любая instruct-LLM в формате mlx-lm, см. «Другие модели» |
-| Как считает | не раскрыто | логиты букв вариантов на копии KV-кэша состояния, усреднение по порядкам вариантов |
-| Калибровка | встроена обучением | подбирается по своей разметке: `fit_calibration`, см. «Калибровка» |
-| Типы вопросов | noul, choice, score, Box (с Jev 1.14) | noul, choice, score |
-| Картинки (`assets`) | есть (бета) | нет: текст или JSON |
-| Лимиты | 64k токенов на запрос, 32k на вопрос (262k с заголовком) | контекст модели и память; choice 2..26 вариантов, score 2..10 уровней |
+| Where it runs | a cloud API (Cloudflare Workers AI, TypeSafe `POST /v1/systemone`), $0.042 per 1M input tokens | locally on Apple silicon (MLX), offline, data stays on the machine |
+| Model | its own, trained to return calibrated decisions (RLCD), architecture not disclosed | any instruct LLM in mlx-lm format, see "Other models" |
+| How it computes | not disclosed | the logits of the option letters on a copy of the state's KV cache, averaged over option orders |
+| Calibration | built in by training | fitted on your own labels: `fit_calibration`, see "Calibration" |
+| Question types | noul, choice, score, Box (from Jev 1.14) | noul, choice, score |
+| Images (`assets`) | yes (beta) | no: text or JSON |
+| Limits | 64k tokens per request, 32k per question (262k with a header) | the model's context and memory; choice 2..26 options, score 2..10 levels |
 
-Только в decision-gem:
+Only in decision-gem:
 
-- `orders_agree` в каждом ответе и `orders="cyclic"` (см. «Порядки вариантов»);
-- `raw=True`: сырые `logprobs` вариантов, и `fit_calibration` по ним;
-- состояния по ключу: `prefill`, `decide(key=...)`, `forget`, `save` / `load`;
-- открытые состояния и `extend`: текст дочитывается в кэш по мере роста;
-- `generate`: та же модель отвечает на обычные промпты;
-- `criteria` у score — также `{значение: описание}`, у choice — также список.
+- `orders_agree` in every answer, `orders="cyclic"` and `orders="single"` (see "Option orders");
+- `raw=True`: the raw option `logprobs`, and `fit_calibration` on them;
+- keyed states: `prefill`, `decide(key=...)`, `forget`, `save` / `load`;
+- open states and `extend`: text is read into the cache as it grows;
+- `generate`: the same model answers ordinary prompts;
+- score `criteria` also as `{value: description}`, choice `criteria` also as a list.
 
-## Состояния по ключу
+## Keyed states
 
-`decide(state, questions)` читает состояние, отвечает и выбрасывает его кэш. Чтобы задать к одному письму много
-вопросов в разное время или переключаться между письмами, состояние читается один раз и хранится под ключом:
+`decide(state, questions)` reads the state, answers and drops its cache. To ask one email many questions at different
+times, or to switch between emails, read the state once and keep it under a key:
 
-| Метод | Что делает |
+| Method | What it does |
 |---|---|
-| `prefill(key, state)` | читает состояние в KV-кэш и хранит под `key`; возвращает число токенов |
-| `decide(key=key, questions=qs)` | вопросы к хранимому состоянию; ровно одно из `state` / `key`, иначе `ValueError` |
-| `gem({"key": key, "questions": qs})` | то же Jev-запросом |
-| `forget(key)` | освобождает память состояния |
-| `save(key, path)` / `load(key, path)` | состояние в файл `.safetensors` и обратно; `load` принимает только файл той же модели |
+| `prefill(key, state)` | reads the state into a KV cache and keeps it under `key`; returns the number of tokens |
+| `decide(key=key, questions=qs)` | questions on a kept state; exactly one of `state` / `key`, else `ValueError` |
+| `gem({"key": key, "questions": qs})` | the same as a Jev request |
+| `forget(key)` | frees the state's memory |
+| `save(key, path)` / `load(key, path)` | the state to a `.safetensors` file and back; `load` takes only a file saved with the same model |
 
-Каждый вопрос считается на своей копии кэша, хранимое состояние не меняется: вопросы независимы, модель не помнит
-прошлых вопросов (это не чат). Ответ по ключу побайтно равен ответу `decide(state, ...)` — проверено на 3 звонках
-в обратном порядке и после `save` + `load`. Копия кэша почти бесплатна: массивы MLX неизменяемы, данные общие, пока
-к копии не дописан вопрос.
+Each question runs on its own copy of the cache, so the kept state does not change: questions are independent and the
+model does not remember earlier questions (it is not a chat). An answer by key is byte-identical to the answer of
+`decide(state, ...)` — checked on 3 calls in reverse order and after `save` + `load`. Copying the cache is almost
+free: MLX arrays are immutable, the data is shared until a question is appended to the copy.
 
-Файл состояния — это текст письма в другом виде: хранить там же, где можно хранить текст.
+A state file is the email's text in another form: keep it only where the text itself may be kept.
 
-### Открытые состояния
+### Open states
 
-`prefill(key, state, open=True)` останавливает кэш сразу после текста состояния; закрывающий `</state>` ещё не
-прочитан. `extend(key, text)` дочитывает текст в этот кэш насовсем (возвращает число добавленных токенов;
-`ValueError` на закрытом состоянии): растущую переписку можно держать открытой и дочитывать новые письма. `decide` на открытом
-состоянии дописывает к каждой копии `</state>` и вопрос и не пишет в хранимый кэш. `save` / `load` сохраняют
-признак «открыто». `split_open(prompt)` — чистая функция: режет готовый промпт перед закрывающим тегом.
+`prefill(key, state, open=True)` stops the cache right after the state text; the closing `</state>` is not read yet.
+`extend(key, text)` reads more text into that cache for good (it returns the tokens added; `ValueError` on a closed
+state), so a growing thread can be kept open and new emails read into it. `decide` on an open state puts `</state>` and the question after the
+cache on every copy and never writes the kept cache. `save` / `load` keep the open flag. `split_open(prompt)` is the
+pure helper that cuts a rendered prompt before the closing tag.
 
-Правило шва: `extend` равен одному чтению, только если новый текст начинается на границе токена. Пробел или перевод
-строки в начале ставьте в новый текст, слово не режьте, кусок не заканчивайте пробельным символом (`extend` бросает
-`ValueError`): `"hello. "` + `"Operator"` токенизируется иначе, чем `"hello. Operator"`. `prefill` обрезает состояние,
-поэтому оно не кончается пробелом.
+Seam rule: `extend` equals one read only when the new text starts at a token boundary. Put the leading space or newline
+in the new text, never split a word, and never end a chunk in whitespace (`extend` raises `ValueError`): `"hello. "` +
+`"Operator"` tokenizes differently from `"hello. Operator"`. `prefill` strips the state, so it never ends in whitespace.
 
-Точность: по умолчанию счёт идёт во float32 (`float32=True`), см. «Ошибка bf16» ниже. `extend` равен одному
-чтению только во float32.
+Precision: the gem computes in float32 by default (`float32=True`), see "The bf16 bug" below. `extend` equals one
+read only in float32.
 
-## Промпты
+## Prompts
 
-`generate(prompt, state=None, *, key=None, max_tokens=512, temperature=0.0)` — модель как обычная чат-модель: ответ
-на промпт генерируется (`mlx_lm.stream_generate`), второй экземпляр модели не грузится.
+`generate(prompt, state=None, *, key=None, max_tokens=512, temperature=0.0)` runs the model as an ordinary chat model:
+the answer to the prompt is generated (`mlx_lm.stream_generate`) by the model already loaded.
 
-| Вызов | Что модель видит |
+| Call | What the model sees |
 |---|---|
-| `generate(prompt)` | только промпт |
-| `generate(prompt, state)` | состояние, затем промпт — там же, где стоял бы вопрос |
-| `generate(prompt, key=key)` | хранимое состояние (`prefill` / `load`), не читается повторно; генерация на копии кэша |
-| `gem({"prompt": …, "state" или "key", "max_tokens", "temperature"})` | то же запросом; CLI принимает такой же JSON |
+| `generate(prompt)` | the prompt only |
+| `generate(prompt, state)` | the state, then the prompt where a question would go |
+| `generate(prompt, key=key)` | the kept state (`prefill` / `load`), not read again; generated on a copy of its cache |
+| `gem({"prompt": …, "state" or "key", "max_tokens", "temperature"})` | the same as a request; the CLI takes this JSON too |
 
-Ответ: `{"model", "text", "finish_reason": "stop" | "length", "usage": {"input_tokens", "output_tokens"}}`.
-`temperature` 0 — жадный выбор: тот же промпт даёт тот же текст. Хранимое состояние генерацией не меняется:
-`decide(key=…)` до и после `generate(key=…)` даёт побайтно одинаковый ответ (тест `-m models`). Ответ по ключу
-равен ответу на тот же `state`.
+Response: `{"model", "text", "finish_reason": "stop" | "length", "usage": {"input_tokens", "output_tokens"}}`.
+`temperature` 0 is greedy: the same prompt gives the same text. Generating leaves a kept state as it was:
+`decide(key=…)` before and after `generate(key=…)` gives byte-identical answers (the `-m models` test); the answer on a
+key equals the answer on the same `state`.
 
-Ограничения: ответ не ограничен JSON-схемой (structured output в mlx-lm нет) — JSON проверять и при ошибке
-спрашивать снова; рядом с Ollama с той же Gemma не запускать (память).
+Limits: the answer is not constrained to a JSON schema (mlx-lm has no structured output) — check JSON and ask again
+on an error; do not run beside Ollama with the same Gemma (memory).
 
-## Ошибка bf16: шум ответа на длинных состояниях (найдена 19.10.2026)
+## The bf16 bug: noisy answers on long states (found 2026-10-19)
 
-**Симптом.** Один и тот же текст давал разный ответ в зависимости от того, как он прочитан: целиком, кусками через
-`extend` или с `</state>` в другом месте. До ~460 токенов ответы совпадали, дальше расходились:
+**Symptom.** The same text gave a different answer depending on how it was read: whole, in chunks with `extend`,
+or with `</state>` in another place. Up to ~460 tokens the answers agreed, beyond that they drifted:
 
-| Токенов в состоянии | Целиком | Кусками (`extend`) |
+| State tokens | Whole | In chunks (`extend`) |
 |---|---|---|
-| ≤ 462 | совпадает | совпадает |
-| 692 | 0,75 | 0,37 |
-| ~1400 | 0,45 | 0,22 |
+| ≤ 462 | same | same |
+| 692 | 0.75 | 0.37 |
+| ~1400 | 0.45 | 0.22 |
 
-Открытое и закрытое состояние на одном длинном тексте: 0,45 и 0,61. Один текст в 1590 токенов при разных способах
-чтения давал `noul` от 0,14 до 0,65: при пороге 0,5 решение «да / нет» зависело от способа чтения, а не от текста.
+Open vs closed state on one long text: 0.45 vs 0.61. One 1590-token text read in different ways gave `noul` from
+0.14 to 0.65: at a 0.5 threshold the yes / no answer depended on the way of reading, not on the text.
 
-**Причина.** Счёт в bf16 меняет выбор экспертов в роутере MoE. Округление bf16 зависит от числа токенов в одном
-чтении. Роутер каждого слоя жёстко выбирает top-8 экспертов (`argpartition`). Когда оценки 8-го и 9-го эксперта
-почти равны (на слое 8 разница 2,8e-5), округление меняет выбор, и расхождение растёт по следующим слоям. В bf16
-были нормы, масштабы и смещения квантования; сами веса 4-битные.
+**Cause.** bf16 compute flips the expert choice of the MoE router. bf16 rounding depends on how many tokens one
+read holds. Each layer's router makes a hard top-8 expert pick (`argpartition`). When the 8th and 9th expert scores
+are nearly equal (at layer 8 the gap was 2.8e-5), rounding flips the pick, and the difference grows through the
+later layers. The norms and the quantization scales and biases were bf16; the weights themselves are 4-bit.
 
-**Исправление.** `DecisionGem(..., float32=True)` по умолчанию. После загрузки все параметры
-bf16 (масштабы и смещения квантования, нормы, эмбеддинги, роутер) приводятся к float32; упакованные 4/8-битные
-веса не меняются. Во float32 разброс 0,568..0,574, `extend` совпадает с одним чтением с точностью до 0,006 (не
-побитно). `float32=False` — прежнее поведение.
+**Fix.** `DecisionGem(..., float32=True)` by default. After loading, every bf16 parameter
+(quantization scales and biases, norms, embeddings, router) is cast to float32; the packed 4/8-bit weights stay as
+they are. In float32 the spread is 0.568..0.574 and `extend` matches one read to within 0.006 (not bit-exact).
+`float32=False` keeps the old behaviour.
 
-Цена: +1,5 ГиБ к модели (13,2 → 14,7 ГиБ), KV-кэш вдвое больше (≈0,43 MiB на токен), чтение примерно в 1,3 раза
-медленнее, в момент загрузки кратко +1,5 ГиБ. Цифры раздела «Ресурсы» сняты в bf16.
+Cost: +1.5 GiB for the model (13.2 → 14.7 GiB), twice the KV cache (≈0.43 MiB per token), reads about 1.3x slower,
+a short +1.5 GiB at load. The "Resources" numbers were measured in bf16.
 
-**Сохранённые состояния.** `save` пишет тип счёта (`dtype`), `load` бросает `ValueError`, если он
-не совпадает с типом модели. Файл без поля считается bf16 (сохранён до исправления). Без проверки состояние bf16
-молча грузилось в модель float32 и давало смешанный кэш с тем же шумом.
+**Saved states.** `save` records the compute dtype (`dtype`), `load` raises `ValueError` when it
+differs from the gem's. A file without the field counts as bf16 (saved before the fix). Without the check a bf16
+state loaded silently into a float32 gem and gave a mixed cache with the same noise.
 
-**Что затронуто.**
-- Всё, что считалось до 19.10.2026 (до версии 0.1.0), шло в bf16.
-- Роли оператор / клиент на 145 звонках (состояние — первые 20 строк): во float32 оператор не сменился ни в одном
-  звонке, точность та же; время 163 с против 127 с. На коротких состояниях шум не виден.
-- Ответы на длинных звонках (чек-лист, весь звонок в состоянии) могли зависеть от шума. Калибровки, подобранные
-  на ответах bf16, надо подобрать заново.
+**What it touched.**
+- Everything computed before 2026-10-19 (before version 0.1.0) ran in bf16.
+- Operator / client roles on 145 calls (state = first 20 lines): in float32 no call changed its operator, accuracy
+  is the same; 163 s vs 127 s. On short states the noise does not show.
+- Answers on long calls (the checklist, the whole call in the state) may have depended on the noise. Calibrations
+  fitted on bf16 answers need refitting.
 
-**TF32 на M5 (найдено 19.10.2026).** Причина: на GPU с нейроускорителями (M5) MLX умножает матрицы float32 в TF32
-(относительная ошибка ~5e-4 вместо ~1e-6) начиная со 128 строк (обычное умножение — с 2), а при меньшем числе строк —
-другим ядром. Одни и те же токены округляются по-разному в зависимости от длины прохода, и почти-ничьи роутера
-переключаются, как в bf16. Симптом на M5 Max: 0,347 кусками против 0,546 целиком. `DecisionGem(float32=True)` ставит
-`MLX_ENABLE_TF32=0` и сверяет умножение float32 с CPU (`float32_matmuls`). MLX читает переменную один раз, при первом
-умножении в процессе: если оно уже было с TF32, модель бросает `RuntimeError`. С исправлением: 0,5739 кусками против
-0,5741 целиком. Цена: чтение в 2 раза медленнее, чем в TF32 (1594 токена 1,6 с против 0,8 с, вопрос 0,30 с против
-0,18 с).
+**TF32 on M5 (found 2026-10-19).** Cause: on GPUs with neural accelerators (M5) MLX multiplies float32 matrices in
+TF32 (relative error ~5e-4 instead of ~1e-6) from 128 rows up (dense: from 2), with another kernel below that. So the
+same tokens get different rounding depending on how many one read holds, and the router's near-ties flip as in bf16.
+Symptom on an M5 Max: 0.347 in chunks vs 0.546 whole. `DecisionGem(float32=True)` sets `MLX_ENABLE_TF32=0` and
+checks a float32 matmul against the CPU (`float32_matmuls`); MLX reads the variable once, at the process's first
+matmul, so if one already ran with TF32 on the gem raises `RuntimeError`. With it: 0.5739 in chunks vs 0.5741 whole.
+Cost: reads 2x slower than in TF32 (1594 tokens 1.6 s vs 0.8 s, a question 0.30 s vs 0.18 s).
 
-**Проверка.** `tests/test_open_model.py` (с моделью): длинное состояние кусками равно одному чтению, открытое равно
-закрытому, допуск 0,02. В bf16 два этих теста падают (0,2306 и 0,1544). Тесты без модели в `tests/test_core.py`
-проверяют приведение типов и `dtype` в `save` / `load`.
+**Check.** `tests/test_open_model.py` (with the model): a long state in chunks equals one read, open equals closed,
+tolerance 0.02. In bf16 these two tests fail (0.2306 and 0.1544). Model-free tests in `tests/test_core.py` cover the
+cast and `dtype` in `save` / `load`.
 
-## Где применялся
+## Where it was used
 
-Речевая аналитика звонков колл-центра, модель `mlx-community/gemma-4-26b-a4b-it-4bit`.
+Speech analytics of call-centre calls, model `mlx-community/gemma-4-26b-a4b-it-4bit`.
 
-- Роли оператор / клиент: верный оператор в 99 из 100 звонков эталона ролей.
-- Статусы пунктов чек-листа, 199 звонков, 2250 пунктов: 7.1 с на звонок, 9 из 9 ручных решений совпали, порядки
-  вариантов согласны в 2094 из 2250.
-- Полный чек-лист без промпта анализа: сценарий, исход, флаги звонка, затем пункты; 199 звонков, 15.5 с на звонок,
-  9 из 9 ручных решений.
+- Operator / client roles: the right operator in 99 of the 100 calls of the roles reference.
+- Checklist item statuses, 199 calls, 2250 items: 7.1 s per call, 9 of 9 manual rulings matched, the option orders
+  agree on 2094 of 2250.
+- The full checklist with no analysis prompt: scenario, outcome, call flags, then the items; 199 calls, 15.5 s per
+  call, 9 of 9 manual rulings.
 
-## Ресурсы
+## Resources
 
-Замеры на самом длинном звонке (3051 токен состояния) и на 199 звонках, 13.10.2026, Mac на Apple silicon, 36 GB:
+Measured on the longest call (3051 tokens of state) and on 199 calls, 2026-10-13, an Apple silicon Mac with 36 GB:
 
-| Что | Время / память |
+| What | Time / memory |
 |---|---|
-| загрузка модели | около 6 с, 13.2 GiB |
-| чтение состояния (`prefill` или начало `decide`) | 4.2 с на 3051 токен (0.8 с на 882) |
-| KV-кэш состояния | ≈0.2 MiB на токен: 656 MiB на 3051 токен; 3 звонка 882–2430 токенов — 1.11 GiB |
-| копия кэша на вопрос | 0.1 мс |
-| один вопрос (два прохода, прямой и обратный порядок) | 221 мс |
-| генерация (`generate`) | 86–97 токенов/с; саммари звонка (653 токена состояния, 71 токен ответа) — 0.7 с (16.10) |
-| `save` / `load` состояния | 0.34 с / 0.02 с, файл 656 MiB |
-| пик памяти на длинных звонках | около 17 GiB (с буферным кэшем MLX было 27.8 GiB) |
-| звонок в прогонах выше | 2–30 с, зависит от числа вопросов |
+| model load | about 6 s, 13.2 GiB |
+| reading a state (`prefill` or the start of `decide`) | 4.2 s for 3051 tokens (0.8 s for 882) |
+| a state's KV cache | ≈0.2 MiB per token: 656 MiB for 3051 tokens; 3 calls of 882–2430 tokens — 1.11 GiB |
+| cache copy per question | 0.1 ms |
+| one question (two passes, options in order and reversed) | 221 ms |
+| generation (`generate`) | 86–97 tokens/s; a call's summary (653 state tokens, 71 answer tokens) in 0.7 s (16.10) |
+| `save` / `load` of a state | 0.34 s / 0.02 s, file 656 MiB |
+| peak memory on long calls | about 17 GiB (27.8 GiB with the MLX buffer cache) |
+| a call in the runs above | 2–30 s, depends on the number of questions |
 
-На 36 GB Mac не запускать рядом с другой большой моделью. Видеокарте доступно около 27 GiB: помимо модели в памяти
-поместится примерно 15 хранимых длинных звонков; больше — через `save` / `load`.
+On a 36 GB Mac do not run it next to another large model. The GPU gets about 27 GiB: besides the model, about 15
+kept long calls fit in memory; more through `save` / `load`.
 
-## Память
+## Memory
 
-- `cache_limit` (по умолчанию 0) — байты освобождённых буферов, которые MLX держит для повторного использования
-  (`mx.set_cache_limit`); `None` — не трогать лимит MLX. С буферами пик был 27.8 GiB вместо 17. Лимит общий на
-  процесс: `unload()` возвращает прежний (по умолчанию MLX — 34.2 GiB на этом Mac).
-- `gem.unload()` освобождает модель и все хранимые состояния (13.2 GiB → 0), не завершая процесс; `decide()` после
-  него — `RuntimeError`. Или `with DecisionGem() as gem: ...` — выгрузка на выходе.
-- `forget(key)` — память одного состояния (3 звонка: 1.11 GiB, после `forget` одного 0.59 GiB).
+- `cache_limit` (default 0) — bytes of freed buffers MLX keeps for reuse (`mx.set_cache_limit`); `None` — leave the
+  MLX limit as it is. With the buffers the peak was 27.8 GiB instead of 17. The limit is process-wide: `unload()`
+  puts back the previous one (the MLX default is 34.2 GiB on this Mac).
+- `gem.unload()` frees the model and all kept states (13.2 GiB → 0) without ending the process; `decide()` after it
+  raises `RuntimeError`. Or `with DecisionGem() as gem: ...` — unloaded on exit.
+- `forget(key)` — one state's memory (3 calls: 1.11 GiB, after `forget` of one 0.59 GiB).
 
-## Другие модели
+## Other models
 
-Модель задаётся `DecisionGem(repo=...)` или `--model`: HF repo id или локальная папка в формате mlx-lm.
+The model is set by `DecisionGem(repo=...)` or `--model`: an HF repo id or a local folder in mlx-lm format.
 
 ```python
 gem = DecisionGem("mlx-community/Qwen3-14B-4bit")
@@ -254,52 +257,53 @@ gem = DecisionGem("mlx-community/Qwen3-14B-4bit")
 decision-gem request.json --model mlx-community/Qwen3-14B-4bit
 ```
 
-Требования к модели:
+What a model needs:
 
-- формат mlx-lm (её грузит `mlx_lm.load`), Apple silicon;
-- instruction-tuned, с chat template;
-- каждая буква A..Z после шаблона ответа — ровно один токен. Проверяется при загрузке (`letter_ids`): иначе
-  `ValueError` до первого вопроса;
-- первый токен ответа — буква, а не начало рассуждения. Шаблон получает `enable_thinking=False`. Модель, которая
-  рассуждает всегда, читается неверно, и проверка этого не ловит.
+- mlx-lm format (`mlx_lm.load` loads it), Apple silicon;
+- instruction-tuned, with a chat template;
+- every letter A..Z after the answer template is exactly one token. Checked at load (`letter_ids`): otherwise
+  `ValueError` before the first question;
+- the first answer token is a letter, not the start of reasoning. The template gets `enable_thinking=False`. A model
+  that always reasons is read wrong, and the check does not catch it.
 
-**Малые модели.** Модели до ~8B параметров без дообучения и без калибровки отвечают слабо. В JevBench v1.6.0
-(Benchmark Heaven, 05.10.2026) сырые Qwen3 с чтением по логитам набрали Capability 34,6 (4B Instruct), 30,1 (8B),
-8,3 (1.7B) и 8,2 (0.6B); замороженные Gemma-4-12B-it и Gemma-4-31B-it — 70,9 и 77,6, Jev 1.13.0 — 76,5. Сюда же
-относятся `gemma-4-e2b` и `gemma-4-e4b` из «Сравнения моделей»: тесты на них проверяют пакет, а не качество
-ответов. Малую модель берите только с калибровкой по своей разметке и проверкой точности на ней.
+**Small models.** Models up to ~8B parameters, with no fine-tuning and no calibration, answer poorly. In JevBench
+v1.6.0 (Benchmark Heaven, 2026-10-05) raw Qwen3 with a logit readout scored a Capability of 34.6 (4B Instruct),
+30.1 (8B), 8.3 (1.7B) and 8.2 (0.6B); frozen Gemma-4-12B-it and Gemma-4-31B-it scored 70.9 and 77.6, Jev 1.13.0 76.5.
+This covers `gemma-4-e2b` and `gemma-4-e4b` in "Model comparison" too: the tests on them check the package, not the
+quality of the answers. Take a small model only with a calibration fitted on your own labels and its accuracy checked
+on them.
 
-Калибровка (`[a, b]`, `T`) у каждой модели своя. Цифры этого README сняты на `gemma-4-26b-a4b-it-4bit`.
+Calibration (`[a, b]`, `T`) is per model. The numbers in this README were measured on `gemma-4-26b-a4b-it-4bit`.
 
-### Сравнение моделей
+### Model comparison
 
-Замер 13.11.2026, Mac на Apple silicon, 36 GB, `float32=True`, `orders="reverse"`. Набор: 3 коротких звонка, к каждому
-6 вопросов — 3 noul, 2 choice, 1 score, всего 18. Тесты — `DECISION_GEM_TEST_MODEL=<repo> pytest -m models`.
+Measured on 2026-11-13, an Apple silicon Mac with 36 GB, `float32=True`, `orders="reverse"`. Set: 3 short calls,
+6 questions each — 3 noul, 2 choice, 1 score, 18 in all. Tests: `DECISION_GEM_TEST_MODEL=<repo> pytest -m models`.
 
-| Модель | Тесты `-m models` | Загрузка | 18 вопросов |
+| Model | `-m models` tests | Load | 18 questions |
 |---|---|---|---|
-| `mlx-community/gemma-4-e2b-it-4bit` | 6 из 6 | 1,4 с | 1,7 с |
-| `mlx-community/gemma-4-e4b-it-4bit` | 6 из 6 | 1,8 с | 3,1 с |
-| `mlx-community/Qwen3-14B-4bit` | 6 из 6 | 3,1 с | 9,2 с |
-| `mlx-community/gemma-4-26b-a4b-it-4bit` (по умолчанию) | 6 из 6 | 4,6 с | 6,7 с |
+| `mlx-community/gemma-4-e2b-it-4bit` | 6 of 6 | 1.4 s | 1.7 s |
+| `mlx-community/gemma-4-e4b-it-4bit` | 6 of 6 | 1.8 s | 3.1 s |
+| `mlx-community/Qwen3-14B-4bit` | 6 of 6 | 3.1 s | 9.2 s |
+| `mlx-community/gemma-4-26b-a4b-it-4bit` (default) | 6 of 6 | 4.6 s | 6.7 s |
 
-Gemma 26B — MoE (активны ~4B параметров), поэтому отвечает быстрее плотной Qwen3-14B.
+Gemma 26B is an MoE (~4B active parameters), so it answers faster than the dense Qwen3-14B.
 
-## Установка и запуск
+## Install and run
 
-Только Apple silicon (MLX). Модель должна заранее лежать в кэше HF, или запускать с `--online` / `offline=False`.
+Apple silicon only (MLX). The model must already be in the HF cache, or run with `--online` / `offline=False`.
 
 ```bash
-pip install decision-gem                  # или из исходников: pip install -e ".[test]"
-python -m decision_gem request.json       # или: decision-gem request.json; - читает stdin
-python -m decision_gem request.json --calibration cal.json --model <repo или папка>
-pytest                                   # тесты без модели; pytest -m models — на модели
+pip install decision-gem                  # or from source: pip install -e ".[test]"
+python -m decision_gem request.json       # or: decision-gem request.json; - reads stdin
+python -m decision_gem request.json --calibration cal.json --model <repo or folder>
+pytest                                   # tests without the model; pytest -m models — on the model
 ```
 
 ```python
 from decision_gem import DecisionGem
 
-email = {"from": '"Secure Bank" <security@secure-bank-verify.top>',   # состояние: текст или JSON-объект
+email = {"from": '"Secure Bank" <security@secure-bank-verify.top>',   # the state: text or a JSON object
          "subject": "Your account has been limited!",
          "body": "Dear customer, we noticed unusual activity. Verify your identity within 24 hours: "
                  "http://secure-bank-verify.top/login or your account will be permanently suspended."}
@@ -310,11 +314,11 @@ qs = {"spam":    {"type": "noul", "instructions": "Is this email spam or phishin
       "urgency": {"type": "score", "instructions": "How hard does the email push the reader to act right away?",
                   "criteria": ["no pressure", "some pressure", "strong pressure"]}}
 
-gem = DecisionGem()                       # mlx-community/gemma-4-26b-a4b-it-4bit из локального кэша HF
+gem = DecisionGem()                       # mlx-community/gemma-4-26b-a4b-it-4bit from the local HF cache
 gem({"state": email, "questions": qs})
 ```
 
-Ответ (Gemma 26B, 474 токена на входе; `legend` и `probabilities` сокращены):
+The answer (Gemma 26B, 474 input tokens; `legend` and `probabilities` cut):
 
 ```json
 {"spam":    {"type": "noul", "noul": 1.0, "orders_agree": true},
@@ -322,19 +326,20 @@ gem({"state": email, "questions": qs})
  "urgency": {"type": "score", "score": 3.0, "confidence": 1.0, "orders_agree": true}}
 ```
 
-На обычном письме коллеги о заметках со встречи те же вопросы дают `spam` 0.0, `kind` `normal`, `urgency` 1.01.
+On an ordinary email from a colleague about meeting notes the same questions give `spam` 0.0, `kind` `normal`,
+`urgency` 1.01.
 
-Несколько состояний сразу (см. «Состояния по ключу»):
+Several states at once (see "Keyed states"):
 
 ```python
 with DecisionGem() as gem:
-    gem.prefill("mail-1", email1)            # число токенов; ≈0.2 MiB памяти на токен, пока не forget / unload
+    gem.prefill("mail-1", email1)            # number of tokens; ≈0.2 MiB of memory per token until forget / unload
     gem.prefill("mail-2", email2)
-    gem.decide(key="mail-2", questions=qs)   # тот же ответ, что decide(email2, qs), без повторного чтения
-    gem({"key": "mail-1", "questions": qs})  # Jev-запрос с key вместо state
-    gem.save("mail-1", "mail-1.safetensors") # на диск; load() читает обратно за ~0.02 с
+    gem.decide(key="mail-2", questions=qs)   # the same answer as decide(email2, qs), without reading again
+    gem({"key": "mail-1", "questions": qs})  # a Jev request with key instead of state
+    gem.save("mail-1", "mail-1.safetensors") # to disk; load() reads it back in ~0.02 s
     gem.forget("mail-1")
-    gem.load("mail-1", "mail-1.safetensors") # только файл, сохранённый той же моделью
+    gem.load("mail-1", "mail-1.safetensors") # only a file saved with the same model
 ```
 
-Полный контракт также в docstring `decision_gem/core.py`.
+The full contract is also in the docstring of `decision_gem/core.py`.

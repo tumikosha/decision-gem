@@ -17,7 +17,8 @@ def main():
     ap.add_argument("--model", default=MODEL, help="HF repo id or local model folder")
     ap.add_argument("--calibration", help="JSON {question id: [a, b] (noul) or T (choice / score)}")
     ap.add_argument("--orders", choices=ORDERS, default="reverse",
-                    help="option orders: in order and reversed (2 passes) or every rotation (n passes)")
+                    help="option orders: in order and reversed (2 passes), every rotation (n passes) "
+                         "or in order only (1 pass, fastest, no bias cancelling)")
     ap.add_argument("--online", action="store_true", help="allow downloading the model")
     ap.add_argument("--raw", action="store_true",
                     help="add the uncalibrated option log-probabilities to every answer (input of fit_calibration)")
